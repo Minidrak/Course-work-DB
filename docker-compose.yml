@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  db:                                                   # docker exec -it course_work_db_2-db-1 bash
+    image: postgres:17                                  # psql -U postgress -d postgress
+    environment:                                        # psql -U (user) -d(db name)
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d/migrations
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+
+  backend:
+    build: ./backend
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - DB_HOST=db
+      - DB_PORT=5432
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./static/uploads:/app/static/uploads
+
+  frontend:
+    build: ./frontend
+    environment:
+      - STREAMLIT_SERVER_PORT=8501
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
+
+  # static:
+  #   image:nginx: alpine
+  #   volumes:
+  #   - ./static:/usr/share/nginx/html
+  #   ports:
+  #   - "8080:80"
+
+volumes:
+  db_data:
