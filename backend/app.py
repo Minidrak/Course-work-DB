@@ -1,4 +1,5 @@
 import os
+import time
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import psycopg2
@@ -6,15 +7,14 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-CORS(app)  # Разрешаем CORS для взаимодействия с фронтендом
+CORS(app)
 
 # Конфигурация для загрузки файлов
 UPLOAD_FOLDER = os.path.join(os.getcwd(), 'static', 'uploads')
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 
+#
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-
-# Убедитесь, что папка для загрузок существует
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 def allowed_file(filename):
@@ -25,7 +25,7 @@ def get_db_connection():
     conn = psycopg2.connect(
         dbname=os.getenv('POSTGRES_DB', 'artshop'),
         user=os.getenv('POSTGRES_USER', 'postgres'),
-        password=os.getenv('POSTGRES_PASSWORD', 'postgres'),
+        password=os.getenv('POSTGRES_PASSWORD', '123'),
         host=os.getenv('DB_HOST', 'db'),
         port=os.getenv('DB_PORT', '5432')
     )
@@ -48,45 +48,53 @@ def get_user_role(user_id):
 
 @app.route('/register', methods=['POST'])
 def register():
+    time.sleep(1)
     data = request.get_json()
     username = data.get('username')
     email = data.get('email')
     password = data.get('password')
-    
+
     if not username or not email or not password:
         return jsonify({'error': 'Username, email and password are required'}), 400
-    
+
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
-        # Проверка, существует ли уже пользователь с таким именем или email
+
+        # Проверка на существование данного email при регистрации
         cur.execute('SELECT id FROM "user" WHERE username = %s OR email = %s', (username, email))
         if cur.fetchone():
             cur.close()
             conn.close()
             return jsonify({'error': 'Username or email already exists'}), 400
-        
+
         password_hash = generate_password_hash(password)
-        
-        # По умолчанию назначаем роль 'regular_user'
-        cur.execute("""
-            INSERT INTO "user" (username, email, password_hash, role_id)
-            VALUES (%s, %s, %s, (SELECT id FROM role WHERE name = 'regular_user'))
-            RETURNING id;
-        """, (username, email, password_hash))
-        
-        user_id = cur.fetchone()[0]
+
+        # Вызов процедуры регистрации
+        cur.execute("CALL register_user_proc(%s, %s, %s);", (username, email, password_hash))
         conn.commit()
+
+        # Узнать id нового пользователя
+        cur.execute('SELECT id FROM "user" WHERE username = %s;', (username,))
+        user_record = cur.fetchone()
+        if user_record:
+            user_id = user_record[0]
+        else:
+            user_id = None
+
         cur.close()
         conn.close()
-        
-        return jsonify({'message': 'User registered successfully', 'user_id': user_id}), 201
+
+        if user_id:
+            return jsonify({'message': 'User registered successfully', 'user_id': user_id}), 201
+        else:
+            return jsonify({'error': 'Registration failed'}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/login', methods=['POST'])
 def login():
+    time.sleep(1)
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
@@ -97,52 +105,59 @@ def login():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute('SELECT password_hash, id FROM "user" WHERE username = %s', (username,))
+
+        # Получение хеш пароля и user_id
+        cur.execute('SELECT id, password_hash FROM "user" WHERE username = %s;', (username,))
         result = cur.fetchone()
+        if not result:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Invalid credentials'}), 401
+
+        user_id, stored_hash = result
+        if not check_password_hash(stored_hash, password):
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Invalid credentials'}), 401
+
+        # Вызывов  функции для получения user_id и роли
+        cur.execute("SELECT * FROM login_user_proc(%s, %s);", (username, stored_hash))
+        login_result = cur.fetchone()
         cur.close()
         conn.close()
-        
-        if result is None:
-            return jsonify({'error': 'Invalid credentials'}), 401
-        
-        stored_hash, user_id = result
-        if check_password_hash(stored_hash, password):
-            # При успешной аутентификации возвращаем user_id
-            return jsonify({'message': 'Login successful', 'user_id': user_id}), 200
+
+        if login_result:
+            fetched_user_id, role = login_result
+            return jsonify({'message': 'Login successful', 'user_id': fetched_user_id, 'role': role}), 200
         else:
             return jsonify({'error': 'Invalid credentials'}), 401
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/artworks', methods=['GET'])
 def get_artworks():
-    # Получаем список произведений искусства из view или напрямую из таблиц
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute('SELECT id, title, description, price, category, stock, photo_url FROM view_artwork_details')
+        cur.execute("SELECT * FROM get_artworks_proc();")
         rows = cur.fetchall()
+        colnames = [desc[0] for desc in cur.description]
         cur.close()
         conn.close()
 
-        artworks = []
-        for r in rows:
-            artworks.append({
-                'id': r[0],
-                'title': r[1],
-                'description': r[2],
-                'price': float(r[3]),
-                'category': r[4],
-                'stock': r[5],
-                'photo_url': r[6]  # Путь к изображению
-            })
+        artworks = [dict(zip(colnames, row)) for row in rows]
+        # Преобразуем price из Decimal
+        for art in artworks:
+            art['price'] = float(art['price'])
+            art['stock'] = int(art['stock']) if art['stock'] is not None else 0
         return jsonify(artworks), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/create_order', methods=['POST'])
 def create_order():
-    # Ожидаем JSON вида:
+    time.sleep(1)
     # {
     #   "user_id": <int>,
     #   "items": [
@@ -160,57 +175,36 @@ def create_order():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Проверка наличия достаточного количества товаров
+        order_ids = []
         for item in items:
             artwork_id = item.get('artwork_id')
             quantity = item.get('quantity', 1)
-            cur.execute("SELECT stock FROM inventory WHERE artwork_id = %s FOR UPDATE", (artwork_id,))
-            result = cur.fetchone()
-            if result is None:
-                conn.rollback()
-                return jsonify({'error': f'Artwork {artwork_id} not found in inventory'}), 400
-            stock = result[0]
-            if stock < quantity:
-                conn.rollback()
-                return jsonify({'error': f'Not enough stock for artwork {artwork_id}. Available: {stock}, Requested: {quantity}'}), 400
+            if not artwork_id or not isinstance(quantity, int):
+                continue
 
-        # Создаем заказ
-        cur.execute("""
-            INSERT INTO "order" (user_id, status)
-            VALUES (%s, 'pending')
-            RETURNING id;
-        """, (user_id,))
-        order_id = cur.fetchone()[0]
+            cur.execute("CALL create_order_proc(%s, %s, %s, %s);", (user_id, artwork_id, quantity, None))
+            conn.commit()
 
-        # Добавляем элементы заказа и обновляем инвентарь
-        for item in items:
-            artwork_id = item.get('artwork_id')
-            quantity = item.get('quantity', 1)
-            # Получаем текущую цену товара
-            cur.execute("SELECT price FROM artwork WHERE id = %s", (artwork_id,))
-            res = cur.fetchone()
-            if res is None:
-                conn.rollback()
-                return jsonify({'error': f'Artwork {artwork_id} not found'}), 400
-
-            price = res[0]
-            # Вставляем позицию заказа
+            # Получение последнего созданного заказ для данного пользователя
             cur.execute("""
-                INSERT INTO orderitem (order_id, artwork_id, quantity, price)
-                VALUES (%s, %s, %s, %s)
-            """, (order_id, artwork_id, quantity, price))
+                SELECT id FROM "order"
+                WHERE user_id = %s
+                ORDER BY order_date DESC
+                LIMIT 1;
+            """, (user_id,))
+            order_record = cur.fetchone()
+            if order_record:
+                order_id = order_record[0]
+                order_ids.append(order_id)
 
-            # Обновляем количество на складе
-            cur.execute("""
-                UPDATE inventory
-                SET stock = stock - %s
-                WHERE artwork_id = %s
-            """, (quantity, artwork_id))
-
-        conn.commit()
         cur.close()
         conn.close()
-        return jsonify({'message': 'Order created successfully', 'order_id': order_id}), 201
+
+        if order_ids:
+            return jsonify({'message': 'Orders created successfully', 'order_ids': order_ids}), 201
+        else:
+            return jsonify({'error': 'No orders were created'}), 400
+
     except psycopg2.Error as pe:
         conn.rollback()
         return jsonify({'error': f'Database error: {str(pe)}'}), 500
@@ -220,13 +214,7 @@ def create_order():
 
 @app.route('/add_review', methods=['POST'])
 def add_review():
-    # Ожидаем JSON вида:
-    # {
-    #   "user_id": <int>,
-    #   "artwork_id": <int>,
-    #   "rating": <int>,
-    #   "comment": <string>
-    # }
+    time.sleep(1)
     data = request.get_json()
     user_id = data.get('user_id')
     artwork_id = data.get('artwork_id')
@@ -236,16 +224,13 @@ def add_review():
     if not user_id or not artwork_id or not rating:
         return jsonify({'error': 'user_id, artwork_id and rating are required'}), 400
 
-    if rating < 1 or rating > 5:
+    if not (1 <= rating <= 5):
         return jsonify({'error': 'rating must be between 1 and 5'}), 400
 
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO reviews (user_id, artwork_id, rating, comment)
-            VALUES (%s, %s, %s, %s)
-        """, (user_id, artwork_id, rating, comment))
+        cur.execute("CALL add_review_proc(%s, %s, %s, %s);", (user_id, artwork_id, rating, comment))
         conn.commit()
         cur.close()
         conn.close()
@@ -255,30 +240,19 @@ def add_review():
         conn.rollback()
         return jsonify({'error': str(e)}), 500
 
-# Административные маршруты
 @app.route('/add_artwork', methods=['POST'])
 def add_artwork():
-    # Ожидаем multipart/form-data с полями:
-    # - user_id
-    # - title
-    # - description
-    # - price
-    # - category
-    # - stock
-    # - photo (файл изображения)
-    if 'user_id' not in request.form:
-        return jsonify({'error': 'user_id is required'}), 400
-
-    user_id = request.form['user_id']
+    time.sleep(1)
+    user_id = request.form.get('user_id')
     title = request.form.get('title')
-    description = request.form.get('description')
+    description = request.form.get('description', '')
     price = request.form.get('price')
     category = request.form.get('category')
     stock = request.form.get('stock', 0)
     photo = request.files.get('photo')
 
-    if not title or not price or not category:
-        return jsonify({'error': 'title, price and category are required'}), 400
+    if not user_id or not title or not price or not category:
+        return jsonify({'error': 'user_id, title, price and category are required'}), 400
 
     try:
         role = get_user_role(user_id)
@@ -288,50 +262,45 @@ def add_artwork():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Получаем id категории
-        cur.execute('SELECT id FROM category WHERE name = %s', (category,))
+        # Получение category_id
+        cur.execute('SELECT id FROM category WHERE name = %s;', (category,))
         category_result = cur.fetchone()
         if not category_result:
+            cur.close()
             conn.close()
             return jsonify({'error': f'Category {category} does not exist'}), 400
         category_id = category_result[0]
 
-        # Вставляем произведение искусства
-        cur.execute("""
-            INSERT INTO artwork (title, description, price, category_id)
-            VALUES (%s, %s, %s, %s)
-            RETURNING id;
-        """, (title, description, price, category_id))
-        artwork_id = cur.fetchone()[0]
-
-        # Вставляем инвентаризацию
-        cur.execute("""
-            INSERT INTO inventory (artwork_id, stock)
-            VALUES (%s, %s);
-        """, (artwork_id, stock))
-
-        # Обработка загрузки изображения
         photo_url = None
         if photo and allowed_file(photo.filename):
             filename = secure_filename(photo.filename)
-            # Уникализируем имя файла
-            unique_filename = f"{artwork_id}_{filename}"
+            unique_filename = f"{int(time.time())}_{filename}"
             photo_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
             photo.save(photo_path)
-            # Путь для доступа к изображению
             photo_url = f"/static/uploads/{unique_filename}"
-            # Обновляем artwork с photo_url
-            cur.execute("""
-                UPDATE artwork
-                SET photo_url = %s
-                WHERE id = %s;
-            """, (photo_url, artwork_id))
-        
+
+        # Вызов процедуры для добавления артворка
+        cur.execute("""
+            CALL add_artwork_proc(%s, %s, %s, %s, %s, %s);
+        """, (title, description, price, category_id, photo_url, stock))
         conn.commit()
+
+        # Получение ID добавленного артикула
+        cur.execute('SELECT id FROM artwork WHERE title = %s;', (title,))
+        artwork_record = cur.fetchone()
+        if artwork_record:
+            artwork_id = artwork_record[0]
+        else:
+            artwork_id = None
+
         cur.close()
         conn.close()
 
-        return jsonify({'message': 'Artwork added successfully', 'artwork_id': artwork_id, 'photo_url': photo_url}), 201
+        if artwork_id:
+            return jsonify({'message': 'Artwork added successfully', 'artwork_id': artwork_id, 'photo_url': photo_url}), 201
+        else:
+            return jsonify({'error': 'Failed to add artwork'}), 500
+
     except Exception as e:
         conn.rollback()
         return jsonify({'error': str(e)}), 500
@@ -353,22 +322,18 @@ def delete_artwork():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Получаем путь к изображению для удаления файла
-        cur.execute('SELECT photo_url FROM artwork WHERE id = %s', (artwork_id,))
+        # Узнать photo_url для удаления файла
+        cur.execute('SELECT photo_url FROM artwork WHERE id = %s;', (artwork_id,))
         photo_result = cur.fetchone()
         photo_url = photo_result[0] if photo_result else None
 
-        # Удаляем инвентаризацию
-        cur.execute('DELETE FROM inventory WHERE artwork_id = %s', (artwork_id,))
-
-        # Удаляем произведение искусства
-        cur.execute('DELETE FROM artwork WHERE id = %s', (artwork_id,))
-
+        # Вызов процедуры для удаления артворка
+        cur.execute("CALL delete_artwork_proc(%s);", (artwork_id,))
         conn.commit()
         cur.close()
         conn.close()
 
-        # Удаляем файл изображения из файловой системы
+        # Удаляем файл изображения
         if photo_url:
             photo_path = os.path.join(os.getcwd(), photo_url.lstrip('/'))
             if os.path.exists(photo_path):
@@ -379,85 +344,15 @@ def delete_artwork():
         conn.rollback()
         return jsonify({'error': str(e)}), 500
 
-@app.route('/update_artwork', methods=['PUT'])
-def update_artwork():
-    # Ожидаем multipart/form-data с полями:
-    # - user_id
-    # - artwork_id
-    # - (опционально) title, description, price, category, stock, photo (файл)
-    if 'user_id' not in request.form or 'artwork_id' not in request.form:
-        return jsonify({'error': 'user_id and artwork_id are required'}), 400
+# @app.route('/update_artwork', methods=['PUT'])
+# def update_artwork():
 
-    user_id = request.form['user_id']
-    artwork_id = request.form['artwork_id']
-    title = request.form.get('title')
-    description = request.form.get('description')
-    price = request.form.get('price')
-    category = request.form.get('category')
-    stock = request.form.get('stock')
-    photo = request.files.get('photo')
-
-    try:
-        role = get_user_role(user_id)
-        if role != 'admin':
-            return jsonify({'error': 'Unauthorized'}), 403
-
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # Обновление категории, если указана
-        if category:
-            cur.execute('SELECT id FROM category WHERE name = %s', (category,))
-            category_result = cur.fetchone()
-            if not category_result:
-                conn.close()
-                return jsonify({'error': f'Category {category} does not exist'}), 400
-            category_id = category_result[0]
-            cur.execute('UPDATE artwork SET category_id = %s WHERE id = %s', (category_id, artwork_id))
-
-        # Обновление остальных полей
-        if title:
-            cur.execute('UPDATE artwork SET title = %s WHERE id = %s', (title, artwork_id))
-        if description:
-            cur.execute('UPDATE artwork SET description = %s WHERE id = %s', (description, artwork_id))
-        if price and float(price) > 0:
-            cur.execute('UPDATE artwork SET price = %s WHERE id = %s', (price, artwork_id))
-
-        # Обновление инвентаризации, если указана
-        if stock and int(stock) >= 0:
-            cur.execute('UPDATE inventory SET stock = %s WHERE artwork_id = %s', (stock, artwork_id))
-
-        # Обработка загрузки нового изображения
-        photo_url = None
-        if photo and allowed_file(photo.filename):
-            filename = secure_filename(photo.filename)
-            unique_filename = f"{artwork_id}_{filename}"
-            photo_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-            photo.save(photo_path)
-            photo_url = f"/static/uploads/{unique_filename}"
-            # Обновляем artwork с новым photo_url
-            cur.execute("""
-                UPDATE artwork
-                SET photo_url = %s
-                WHERE id = %s;
-            """, (photo_url, artwork_id))
-        
-        conn.commit()
-        cur.close()
-        conn.close()
-
-        return jsonify({'message': 'Artwork updated successfully', 'photo_url': photo_url}), 200
-    except Exception as e:
-        conn.rollback()
-        return jsonify({'error': str(e)}), 500
 
 @app.route('/get_user_role', methods=['GET'])
 def get_role():
     user_id = request.args.get('user_id')
-    
     if not user_id:
         return jsonify({'error': 'user_id is required'}), 400
-    
     try:
         role = get_user_role(user_id)
         if role:
@@ -467,36 +362,26 @@ def get_role():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Маршрут для обслуживания статических файлов (изображений)
+# Маршрут для обслуживания статических файлов (изображений)   artwoork_id___filename
 @app.route('/static/uploads/<filename>')
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
 
 @app.route('/reviews/<int:artwork_id>', methods=['GET'])
 def get_reviews(artwork_id):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("""
-            SELECT r.rating, r.comment, r.review_date, u.username
-            FROM reviews r
-            JOIN "user" u ON r.user_id = u.id
-            WHERE r.artwork_id = %s
-            ORDER BY r.review_date DESC;
-        """, (artwork_id,))
-        reviews = cur.fetchall()
+        cur.execute("SELECT * FROM get_reviews_proc(%s);", (artwork_id,))
+        reviews_data = cur.fetchall()
+        colnames = [desc[0] for desc in cur.description]
         cur.close()
         conn.close()
-        
-        reviews_list = []
-        for review in reviews:
-            reviews_list.append({
-                'rating': review[0],
-                'comment': review[1],
-                'review_date': review[2].strftime('%Y-%m-%d %H:%M:%S'),
-                'username': review[3]
-            })
+
+        reviews_list = [dict(zip(colnames, row)) for row in reviews_data]
+        # Форматируем дату
+        for review in reviews_list:
+            review['review_date'] = review['review_date'].strftime('%Y-%m-%d %H:%M:%S')
         return jsonify(reviews_list), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -517,7 +402,7 @@ def get_orders(user_id):
         orders = cur.fetchall()
         cur.close()
         conn.close()
-        
+
         orders_dict = {}
         for order in orders:
             order_id = order[0]
@@ -533,8 +418,7 @@ def get_orders(user_id):
                 'quantity': order[5],
                 'price': float(order[6])
             })
-        
-        # Преобразуем словарь в список
+
         orders_list = []
         for order_id, details in orders_dict.items():
             orders_list.append({
@@ -543,11 +427,11 @@ def get_orders(user_id):
                 'status': details['status'],
                 'items': details['items']
             })
-        
+
         return jsonify(orders_list), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    
+
 @app.route('/admin/orders', methods=['GET'])
 def get_all_orders():
     try:
@@ -564,7 +448,7 @@ def get_all_orders():
         orders = cur.fetchall()
         cur.close()
         conn.close()
-        
+
         orders_dict = {}
         for order in orders:
             order_id = order[0]
@@ -581,8 +465,7 @@ def get_all_orders():
                 'quantity': order[6],
                 'price': float(order[7])
             })
-        
-        # Преобразуем словарь в список
+
         orders_list = []
         for order_id, details in orders_dict.items():
             orders_list.append({
@@ -592,7 +475,7 @@ def get_all_orders():
                 'username': details['username'],
                 'items': details['items']
             })
-        
+
         return jsonify(orders_list), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
