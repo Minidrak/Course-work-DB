@@ -1,4 +1,3 @@
--- db/migrations/ddl.sql
 
 -- Таблица ролей
 CREATE TABLE IF NOT EXISTS role (
