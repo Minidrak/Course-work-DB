@@ -1,4 +1,3 @@
--- db/migrations/ddl.sql
 
 -- Таблица ролей
 CREATE TABLE IF NOT EXISTS role (
@@ -83,22 +82,6 @@ AFTER INSERT ON reviews
 FOR EACH ROW
 EXECUTE FUNCTION update_last_review_date();
 
--- CREATE OR REPLACE VIEW view_artwork_details AS
--- SELECT 
---     a.id,
---     a.title,
---     a.description,
---     a.price,
---     c.name AS category,
---     i.stock,
---     a.photo_url,
---     a.last_review_date
--- FROM 
---     artwork a
--- JOIN 
---     category c ON a.category_id = c.id
--- JOIN 
---     inventory i ON a.id = i.artwork_id;
 
 --  процедура для регистрации пользователя
 CREATE OR REPLACE PROCEDURE register_user_proc(
@@ -132,7 +115,7 @@ BEGIN
     FROM "user" u
     JOIN role r ON u.role_id = r.id
     WHERE u.username = p_username
-      AND u.password_hash = p_password; -- Здесь предполагается, что хеширование пароля выполняется заранее
+      AND u.password_hash = p_password; 
 END;
 $$ LANGUAGE plpgsql;
 
