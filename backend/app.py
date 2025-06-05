@@ -1,10 +1,12 @@
 import os
 import time
+import secrets
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import psycopg2
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+from redis_config import store_token, get_token, delete_token, store_session_data, get_session_data, delete_session_data
 
 app = Flask(__name__)
 CORS(app)
@@ -46,6 +48,23 @@ def get_user_role(user_id):
         return result[0]
     return None
 
+def generate_auth_token():
+    """Generate a secure random token"""
+    return secrets.token_hex(32)
+
+def verify_token(token):
+    """Verify if token exists in Redis and return user_id"""
+    if not token:
+        return None
+    
+    # Search for token in Redis
+    for key in redis_client.scan_iter("user_token:*"):
+        stored_token = redis_client.get(key)
+        if stored_token == token:
+            user_id = key.split(':')[1]
+            return user_id
+    return None
+
 @app.route('/register', methods=['POST'])
 def register():
     time.sleep(1)
@@ -79,6 +98,16 @@ def register():
         user_record = cur.fetchone()
         if user_record:
             user_id = user_record[0]
+            # Generate and store token
+            token = generate_auth_token()
+            store_token(user_id, token)
+            # Store session data
+            session_data = {
+                'username': username,
+                'email': email,
+                'role': 'user'  # Default role for new users
+            }
+            store_session_data(user_id, session_data)
         else:
             user_id = None
 
@@ -86,7 +115,11 @@ def register():
         conn.close()
 
         if user_id:
-            return jsonify({'message': 'User registered successfully', 'user_id': user_id}), 201
+            return jsonify({
+                'message': 'User registered successfully',
+                'user_id': user_id,
+                'token': token
+            }), 201
         else:
             return jsonify({'error': 'Registration failed'}), 500
     except Exception as e:
@@ -120,7 +153,7 @@ def login():
             conn.close()
             return jsonify({'error': 'Invalid credentials'}), 401
 
-        # Вызывов  функции для получения user_id и роли
+        # Вызов функции для получения user_id и роли
         cur.execute("SELECT * FROM login_user_proc(%s, %s);", (username, stored_hash))
         login_result = cur.fetchone()
         cur.close()
@@ -128,12 +161,43 @@ def login():
 
         if login_result:
             fetched_user_id, role = login_result
-            return jsonify({'message': 'Login successful', 'user_id': fetched_user_id, 'role': role}), 200
+            # Generate and store token
+            token = generate_auth_token()
+            store_token(fetched_user_id, token)
+            # Store session data
+            session_data = {
+                'username': username,
+                'role': role
+            }
+            store_session_data(fetched_user_id, session_data)
+            
+            return jsonify({
+                'message': 'Login successful',
+                'user_id': fetched_user_id,
+                'role': role,
+                'token': token
+            }), 200
         else:
             return jsonify({'error': 'Invalid credentials'}), 401
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    token = request.headers.get('Authorization')
+    if not token:
+        return jsonify({'error': 'No token provided'}), 401
+
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Invalid token'}), 401
+
+    # Delete token and session data
+    delete_token(user_id)
+    delete_session_data(user_id)
+    
+    return jsonify({'message': 'Logged out successfully'}), 200
 
 @app.route('/artworks', methods=['GET'])
 def get_artworks():
