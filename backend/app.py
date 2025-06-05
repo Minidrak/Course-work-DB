@@ -6,7 +6,12 @@ from flask_cors import CORS
 import psycopg2
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from redis_config import store_token, get_token, delete_token, store_session_data, get_session_data, delete_session_data
+from redis_config import (
+    store_token, get_token, delete_token, store_session_data, get_session_data, delete_session_data,
+    cache_artworks, get_cached_artworks, invalidate_artworks_cache,
+    cache_artwork_reviews, get_cached_artwork_reviews, invalidate_artwork_reviews_cache,
+    publish_notification, redis_client
+)
 
 app = Flask(__name__)
 CORS(app)
@@ -161,10 +166,10 @@ def login():
 
         if login_result:
             fetched_user_id, role = login_result
-            # Generate and store token
+            # Генерируем и сохраняем токен
             token = generate_auth_token()
             store_token(fetched_user_id, token)
-            # Store session data
+
             session_data = {
                 'username': username,
                 'role': role
@@ -193,7 +198,7 @@ def logout():
     if not user_id:
         return jsonify({'error': 'Invalid token'}), 401
 
-    # Delete token and session data
+    # Удаляем токен и данные сессии при выходе
     delete_token(user_id)
     delete_session_data(user_id)
     
@@ -202,6 +207,16 @@ def logout():
 @app.route('/artworks', methods=['GET'])
 def get_artworks():
     try:
+        # Сначала пробуем взять кэш
+        try:
+            cached_artworks = get_cached_artworks()
+            if cached_artworks:
+                return jsonify(cached_artworks), 200
+        except Exception as cache_error:
+            print(f"Cache error: {str(cache_error)}")
+            
+
+        # Если нет кэша, то берем из базы
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT * FROM get_artworks_proc();")
@@ -215,19 +230,21 @@ def get_artworks():
         for art in artworks:
             art['price'] = float(art['price'])
             art['stock'] = int(art['stock']) if art['stock'] is not None else 0
+
+        # Пытаемся кэшировать результаты
+        try:
+            cache_artworks(artworks)
+        except Exception as cache_error:
+            print(f"Cache error: {str(cache_error)}")
+            
+        
         return jsonify(artworks), 200
     except Exception as e:
+        print(f"Error in get_artworks: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/create_order', methods=['POST'])
 def create_order():
-    time.sleep(1)
-    # {
-    #   "user_id": <int>,
-    #   "items": [
-    #       {"artwork_id": <int>, "quantity": <int>}
-    #   ]
-    # }
     data = request.get_json()
     user_id = data.get('user_id')
     items = data.get('items')
@@ -261,47 +278,61 @@ def create_order():
                 order_id = order_record[0]
                 order_ids.append(order_id)
 
+                # Отправляем уведомление о новом заказе PubSub
+                notification = {
+                    'type': 'new_order',
+                    'order_id': order_id,
+                    'user_id': user_id,
+                    'artwork_id': artwork_id,
+                    'quantity': quantity
+                }
+                publish_notification('orders', notification)
+
         cur.close()
         conn.close()
 
-        if order_ids:
-            return jsonify({'message': 'Orders created successfully', 'order_ids': order_ids}), 201
-        else:
-            return jsonify({'error': 'No orders were created'}), 400
-
-    except psycopg2.Error as pe:
-        conn.rollback()
-        return jsonify({'error': f'Database error: {str(pe)}'}), 500
+        return jsonify({'message': 'Orders created successfully', 'order_ids': order_ids}), 201
     except Exception as e:
-        conn.rollback()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/add_review', methods=['POST'])
 def add_review():
-    time.sleep(1)
     data = request.get_json()
     user_id = data.get('user_id')
     artwork_id = data.get('artwork_id')
     rating = data.get('rating')
-    comment = data.get('comment', '')
+    comment = data.get('comment')
 
-    if not user_id or not artwork_id or not rating:
-        return jsonify({'error': 'user_id, artwork_id and rating are required'}), 400
-
-    if not (1 <= rating <= 5):
-        return jsonify({'error': 'rating must be between 1 and 5'}), 400
+    if not all([user_id, artwork_id, rating]):
+        return jsonify({'error': 'Missing required fields'}), 400
 
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("CALL add_review_proc(%s, %s, %s, %s);", (user_id, artwork_id, rating, comment))
+        cur.execute("""
+            INSERT INTO review (user_id, artwork_id, rating, comment)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id;
+        """, (user_id, artwork_id, rating, comment))
+        review_id = cur.fetchone()[0]
         conn.commit()
         cur.close()
         conn.close()
 
-        return jsonify({'message': 'Review added successfully'}), 201
+        # Удаляем кэш для этого артикула
+        invalidate_artwork_reviews_cache(artwork_id)
+
+        # Отправляем уведомление о новом отзыве PubSub
+        notification = {
+            'type': 'new_review',
+            'artwork_id': artwork_id,
+            'user_id': user_id,
+            'rating': rating
+        }
+        publish_notification('artwork_reviews', notification)
+
+        return jsonify({'message': 'Review added successfully', 'review_id': review_id}), 201
     except Exception as e:
-        conn.rollback()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/add_artwork', methods=['POST'])
@@ -361,6 +392,18 @@ def add_artwork():
         conn.close()
 
         if artwork_id:
+            # Удаляем кэш для всех артикулов
+            invalidate_artworks_cache()
+
+            # Отправляем уведомление о новом артикуле PubSub
+            notification = {
+                'type': 'new_artwork',
+                'artwork_id': artwork_id,
+                'title': title,
+                'price': price
+            }
+            publish_notification('artworks', notification)
+
             return jsonify({'message': 'Artwork added successfully', 'artwork_id': artwork_id, 'photo_url': photo_url}), 201
         else:
             return jsonify({'error': 'Failed to add artwork'}), 500
@@ -434,19 +477,31 @@ def uploaded_file(filename):
 @app.route('/reviews/<int:artwork_id>', methods=['GET'])
 def get_reviews(artwork_id):
     try:
+        # сначала пробуем взять кэш
+        cached_reviews = get_cached_artwork_reviews(artwork_id)
+        if cached_reviews:
+            return jsonify(cached_reviews), 200
+
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM get_reviews_proc(%s);", (artwork_id,))
-        reviews_data = cur.fetchall()
+        cur.execute("""
+            SELECT r.*, u.username 
+            FROM review r
+            JOIN "user" u ON r.user_id = u.id
+            WHERE r.artwork_id = %s
+            ORDER BY r.review_date DESC;
+        """, (artwork_id,))
+        rows = cur.fetchall()
         colnames = [desc[0] for desc in cur.description]
         cur.close()
         conn.close()
 
-        reviews_list = [dict(zip(colnames, row)) for row in reviews_data]
-        # Форматируем дату
-        for review in reviews_list:
-            review['review_date'] = review['review_date'].strftime('%Y-%m-%d %H:%M:%S')
-        return jsonify(reviews_list), 200
+        reviews = [dict(zip(colnames, row)) for row in rows]
+        
+        # кэшируем результаты
+        cache_artwork_reviews(artwork_id, reviews)
+        
+        return jsonify(reviews), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
